@@ -1,4 +1,5 @@
-@page "/Sync/"
+@page "/"
+@using System.Text.RegularExpressions
 @inject IJSRuntime JS
 @inject HttpClient Http
 @implements IAsyncDisposable
@@ -9,12 +10,10 @@
         <h3>سخنرانی‌ها</h3>
 
         <div class="upload-box">
-            <label>فایل صوتی</label>
-            <InputFile id="audioFileInput" OnChange="OnAudioFileSelected" accept="audio/*" />
-        </div>
-        <div class="upload-box">
-            <label>فایل متن زمان‌بندی‌شده (.txt)</label>
-            <InputFile OnChange="OnTimedTextSelected" accept=".txt" />
+            <label for="folderInput" class="folder-btn @(isLoading ? "disabled" : "")">
+                📁 انتخاب پوشه سخنرانی‌ها
+            </label>
+            <InputFile OnChange="OnFolderSelected" AdditionalAttributes="folderAttrs" />
         </div>
 
         @if (!string.IsNullOrEmpty(statusMessage))
@@ -57,7 +56,7 @@
         }
         else
         {
-            <p class="hint">یک فایل صوتی و فایل متن زمان‌بندی‌شده انتخاب کنید تا به لیست اضافه شود.</p>
+            <p class="hint">پوشه‌ی اصلی سخنرانی‌ها را انتخاب کنید؛ سپس یک سخنرانی را از لیست سمت راست باز کنید.</p>
         }
     </main>
 
@@ -65,21 +64,26 @@
 
 @code {
     private static readonly Regex LineRegex = new(
-        @"^\[\s*(\d{1,2}(?::\d{2}){1,2})\s*-\s*(\d{1,2}(?::\d{2}){1,2})\s*\]\s*(.*)$",
+        @"^\[?\s*(\d{1,2}(?::\d{2}){1,2}(?:[.,]\d+)?)\s*(?:-->|-|–|—|→|تا)\s*(\d{1,2}(?::\d{2}){1,2}(?:[.,]\d+)?)\s*\]?\s*(.*)$",
         RegexOptions.Compiled);
+
+    private readonly Dictionary<string, object> folderAttrs = new()
+    {
+        { "id", "folderInput" },
+        { "style", "display:none" },
+        { "webkitdirectory", true },
+        { "multiple", true }
+    };
 
     private List<Lecture> lectures = new();
     private int? activeLectureId;
     private List<Segment> segments = new();
     private int activeId = -1;
 
-    private string? pendingAudioUrl;
-    private string? pendingAudioTitle;
-    private List<Segment>? pendingSegments;
-
     private int nextLectureId = 1;
     private string statusMessage = "";
     private bool isError;
+    private bool isLoading;
     private DotNetObjectReference<Home>? dotNetRef;
 
     protected override void OnInitialized() => dotNetRef = DotNetObjectReference.Create(this);
@@ -88,15 +92,33 @@
     {
         if (firstRender)
         {
-            // شنونده‌ی timeupdate فقط یک‌بار وصل می‌شود؛ عنصر audio بین سخنرانی‌ها عوض نمی‌شود، فقط src آن تغییر می‌کند
             await JS.InvokeVoidAsync("lectureSync.initTimeUpdate", "audioPlayer", dotNetRef);
-            await TryLoadSampleLecture();
+
+            // اول سخنرانی‌های ذخیره‌شده؛ اگر نبود، فایل نمونه
+            var restored = await RestoreSavedLectures();
+            if (!restored) await TryLoadSampleLecture();
         }
     }
 
-    // اگر داخل wwwroot/sample فایل نمونه (lecture.txt + lecture.mp3) وجود داشته باشد،
-    // خودکار به‌عنوان اولین سخنرانی به لیست اضافه و پخش می‌شود — بدون نیاز به آپلود دستی.
-    // اگر این فایل‌ها وجود نداشته باشند، بی‌سروصدا رد می‌شود و برنامه عادی کار می‌کند.
+    private async Task<bool> RestoreSavedLectures()
+    {
+        try
+        {
+            var items = await JS.InvokeAsync<List<FolderLecture>>("lectureSync.loadSaved");
+            var (loaded, _) = BuildLectures(items);
+            if (loaded.Count == 0) return false;
+
+            lectures = loaded;
+            SetStatus($"{loaded.Count} سخنرانی از حافظه‌ی قبلی بارگذاری شد.", false);
+            StateHasChanged();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private async Task TryLoadSampleLecture()
     {
         try
@@ -113,68 +135,63 @@
         }
         catch
         {
-            // فایل نمونه موجود نیست یا در دسترس نیست؛ مشکلی نیست
+            // فایل نمونه موجود نیست؛ مشکلی نیست
         }
     }
 
-    // --- انتخاب فایل صوتی (بخشی از فرم افزودن سخنرانی جدید) ---
-    private async Task OnAudioFileSelected(InputFileChangeEventArgs e)
+    private (List<Lecture> loaded, int skipped) BuildLectures(List<FolderLecture> items)
     {
-        try
-        {
-            pendingAudioUrl = await JS.InvokeAsync<string?>("lectureSync.createObjectUrl", "audioFileInput");
-            pendingAudioTitle = System.IO.Path.GetFileNameWithoutExtension(e.File.Name);
-            await TryAddLecture();
-        }
-        catch (Exception ex)
-        {
-            SetStatus("خطا در خواندن فایل صوتی: " + ex.Message, true);
-        }
-    }
+        var loaded = new List<Lecture>();
+        int skipped = 0;
 
-    // --- انتخاب فایل متن زمان‌بندی‌شده (بخش دیگر فرم افزودن) ---
-    private async Task OnTimedTextSelected(InputFileChangeEventArgs e)
-    {
-        try
+        foreach (var item in items)
         {
-            using var stream = e.File.OpenReadStream(maxAllowedSize: 20 * 1024 * 1024);
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            var text = await reader.ReadToEndAsync();
-            pendingSegments = ParseTimedText(text);
-
-            if (pendingSegments.Count == 0)
+            var segs = ParseTimedText(item.Text ?? "");
+            if (segs.Count == 0 || string.IsNullOrEmpty(item.AudioUrl))
             {
-                SetStatus("هیچ خطی با فرمت [MM:SS - MM:SS] متن در فایل پیدا نشد.", true);
+                skipped++;
+                continue;
+            }
+            loaded.Add(new Lecture(nextLectureId++, item.Title, item.AudioUrl, segs));
+        }
+        return (loaded, skipped);
+    }
+
+    // --- انتخاب پوشه‌ی اصلی ---
+    private async Task OnFolderSelected(InputFileChangeEventArgs e)
+    {
+        isLoading = true;
+        SetStatus("در حال خواندن و ذخیره‌ی پوشه‌ها...", false);
+        StateHasChanged();
+
+        try
+        {
+            var items = await JS.InvokeAsync<List<FolderLecture>>("lectureSync.readFolder", "folderInput");
+            var (loaded, skipped) = BuildLectures(items);
+
+            if (loaded.Count == 0)
+            {
+                SetStatus("در این پوشه هیچ سخنرانی معتبری (mp3 + txt زمان‌بندی‌شده) پیدا نشد. لیست قبلی دست نخورد.", true);
                 return;
             }
-            await TryAddLecture();
+
+            // کل لیست قبلی جایگزین می‌شود
+            lectures = loaded;
+            segments = new();
+            activeLectureId = null;
+            activeId = -1;
+
+            SetStatus($"{loaded.Count} سخنرانی بارگذاری و ذخیره شد" +
+                      (skipped > 0 ? $" ({skipped} پوشه نامعتبر رد شد)." : "."), false);
         }
         catch (Exception ex)
         {
-            SetStatus("خطا در خواندن فایل متن: " + ex.Message, true);
+            SetStatus("خطا در خواندن پوشه: " + ex.Message, true);
         }
-    }
-
-    // وقتی هم فایل صوتی و هم فایل متن آماده باشند، یک سخنرانی جدید به لیست اضافه و فعال می‌شود
-    private async Task TryAddLecture()
-    {
-        if (pendingAudioUrl is null || pendingSegments is null || pendingSegments.Count == 0)
-            return;
-
-        var lecture = new Lecture(
-            nextLectureId++,
-            string.IsNullOrWhiteSpace(pendingAudioTitle) ? $"سخنرانی {nextLectureId}" : pendingAudioTitle!,
-            pendingAudioUrl,
-            pendingSegments);
-
-        lectures.Add(lecture);
-
-        pendingAudioUrl = null;
-        pendingSegments = null;
-        pendingAudioTitle = null;
-
-        SetStatus($"«{lecture.Title}» به لیست اضافه شد.", false);
-        await SelectLecture(lecture);
+        finally
+        {
+            isLoading = false;
+        }
     }
 
     private async Task SelectLecture(Lecture lecture)
@@ -185,44 +202,79 @@
         await JS.InvokeVoidAsync("lectureSync.setAudioSrc", "audioPlayer", lecture.AudioUrl);
     }
 
+    // هم «زمان و متن در یک خط» را می‌پذیرد، هم «زمان در یک خط و متن در خط بعد»
     private static List<Segment> ParseTimedText(string text)
     {
         var result = new List<Segment>();
         int id = 0;
+        double start = 0, end = 0;
+        var sb = new System.Text.StringBuilder();
+        bool open = false;
+
+        void Flush()
+        {
+            if (!open) return;
+            var t = sb.ToString().Trim();
+            if (t.Length > 0) result.Add(new Segment(id++, start, end, t));
+            sb.Clear();
+            open = false;
+        }
+
         foreach (var raw in text.Replace("\r\n", "\n").Split('\n'))
         {
-            var line = raw.Trim();
+            var line = raw.Trim().TrimStart('\uFEFF').Trim();
             if (line.Length == 0) continue;
+
             var m = LineRegex.Match(line);
-            if (!m.Success) continue;
-            result.Add(new Segment(id++,
-                ParseTimeToSeconds(m.Groups[1].Value),
-                ParseTimeToSeconds(m.Groups[2].Value),
-                m.Groups[3].Value.Trim()));
+            if (m.Success)
+            {
+                Flush();
+                start = ParseTimeToSeconds(m.Groups[1].Value);
+                end = ParseTimeToSeconds(m.Groups[2].Value);
+                sb.Append(m.Groups[3].Value);
+                open = true;
+            }
+            else if (open)
+            {
+                // خطی بدون زمان = ادامه‌ی متن همان بخش
+                if (sb.Length > 0) sb.Append(' ');
+                sb.Append(line);
+            }
         }
+        Flush();
         return result;
     }
 
     private static double ParseTimeToSeconds(string t)
     {
+        t = NormalizeDigits(t).Replace(',', '.');
         double seconds = 0;
-        foreach (var part in t.Split(':')) seconds = seconds * 60 + int.Parse(part);
+        foreach (var part in t.Split(':'))
+            seconds = seconds * 60 + double.Parse(part, System.Globalization.CultureInfo.InvariantCulture);
         return seconds;
     }
 
-    // کلیک روی یک بخش از متن: پخش را به ابتدای آن بخش می‌برد و *ادامه می‌دهد* (پاوز نمی‌شود)
+    private static string NormalizeDigits(string s)
+    {
+        var sb = new System.Text.StringBuilder(s.Length);
+        foreach (var c in s)
+        {
+            if (c >= '۰' && c <= '۹') sb.Append((char)('0' + (c - '۰')));
+            else if (c >= '٠' && c <= '٩') sb.Append((char)('0' + (c - '٠')));
+            else sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
     private async Task OnSegmentClick(Segment s)
     {
         await JS.InvokeVoidAsync("lectureSync.seekTo", "audioPlayer", s.Start, true);
         activeId = s.Id;
     }
 
-    // از جاوااسکریپت هر بار زمان پخش صوت تغییر کند صدا زده می‌شود
     [JSInvokable]
     public void OnTimeUpdate(double currentTime)
     {
-        // آخرین جمله‌ای که زمان شروعش رسیده، فعال است — حتی اگر زمان پایانش گذشته باشد.
-        // این‌طوری هایلایت تا شروع جمله‌ی بعدی باقی می‌ماند و هیچ‌وقت خاموش نمی‌شود.
         var match = segments.LastOrDefault(s => s.Start <= currentTime);
         var newId = match?.Id ?? -1;
         if (newId != activeId)
@@ -246,4 +298,11 @@
 
     private record Segment(int Id, double Start, double End, string Text);
     private record Lecture(int Id, string Title, string AudioUrl, List<Segment> Segments);
+
+    private class FolderLecture
+    {
+        public string Title { get; set; } = "";
+        public string? AudioUrl { get; set; }
+        public string? Text { get; set; }
+    }
 }
